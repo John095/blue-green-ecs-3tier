@@ -1,0 +1,147 @@
+name: Blue-Green Deployment
+
+on:
+  workflow_dispatch:
+
+env:
+  AWS_REGION: us-east-1
+  ECR_FRONTEND_REPOSITORY: blue-green-ecs-3tier-frontend
+  ECR_BACKEND_REPOSITORY: blue-green-ecs-3tier-backend
+  ECS_CLUSTER: blue-green-ecs-3tier-cluster
+  ECS_SERVICE: blue-green-ecs-3tier-service
+  CODEDEPLOY_APP: blue-green-ecs-3tier-app
+  CODEDEPLOY_GROUP: blue-green-ecs-3tier-deployment-group
+  TASK_DEFINITION_FAMILY: blue-green-ecs-3tier-task
+
+jobs:
+  deploy:
+    name: Deploy to ECS
+    runs-on: ubuntu-latest
+
+    steps:
+      # Step 1: Checkout code
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      # Step 2: Configure AWS credentials
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      # Step 3: Login to Amazon ECR
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v1
+
+      # Step 4: Build and push Frontend Docker image
+      - name: Build, tag, and push Frontend image to ECR
+        id: build-frontend
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          cd frontend
+          docker build -t $ECR_REGISTRY/$ECR_FRONTEND_REPOSITORY:$IMAGE_TAG .
+          docker push $ECR_REGISTRY/$ECR_FRONTEND_REPOSITORY:$IMAGE_TAG
+          docker tag $ECR_REGISTRY/$ECR_FRONTEND_REPOSITORY:$IMAGE_TAG $ECR_REGISTRY/$ECR_FRONTEND_REPOSITORY:latest
+          docker push $ECR_REGISTRY/$ECR_FRONTEND_REPOSITORY:latest
+          echo "image=$ECR_REGISTRY/$ECR_FRONTEND_REPOSITORY:$IMAGE_TAG" >> $GITHUB_OUTPUT
+
+      # Step 5: Build and push Backend Docker image
+      - name: Build, tag, and push Backend image to ECR
+        id: build-backend
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          cd backend
+          docker build -t $ECR_REGISTRY/$ECR_BACKEND_REPOSITORY:$IMAGE_TAG .
+          docker push $ECR_REGISTRY/$ECR_BACKEND_REPOSITORY:$IMAGE_TAG
+          docker tag $ECR_REGISTRY/$ECR_BACKEND_REPOSITORY:$IMAGE_TAG $ECR_REGISTRY/$ECR_BACKEND_REPOSITORY:latest
+          docker push $ECR_REGISTRY/$ECR_BACKEND_REPOSITORY:latest
+          echo "image=$ECR_REGISTRY/$ECR_BACKEND_REPOSITORY:$IMAGE_TAG" >> $GITHUB_OUTPUT
+
+      # Step 6: Get current task definition
+      - name: Download current task definition
+        run: |
+          aws ecs describe-task-definition \
+              --task-definition ${{ env.TASK_DEFINITION_FAMILY }} \
+              --query 'taskDefinition' \
+              > task-definition.json
+
+      # Step 7: Update task definition with new images
+      - name: Fill in new Frontend image in task definition
+        id: task-def-frontend
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        with:
+          task-definition: task-definition.json
+          container-name: frontend
+          image: ${{ steps.build-frontend.outputs.image }}
+
+      - name: Fill in new Backend image in task definition
+        id: task-def-backend
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        with:
+          task-definition: ${{ steps.task-def-frontend.outputs.task-definition }}
+          container-name: backend
+          image: ${{ steps.build-backend.outputs.image }}
+
+      # Step 8: Register new task definition
+      - name: Register new task definition
+        id: register-task-def
+        run: |
+          TASK_DEF_ARN=$(aws ecs register-task-definition \
+              --cli-input-json file://${{ steps.task-def-backend.outputs.task-definition }} \
+              --query 'taskDefinition.taskDefinitionArn' \
+              --output text)
+          echo "task-def-arn=$TASK_DEF_ARN" >> $GITHUB_OUTPUT
+
+      # Step 9: Create AppSpec for CodeDeploy
+      - name: Create AppSpec file
+        run: |
+          cat > appspec.yaml << EOF
+          version: 0.0
+          Resources:
+              - TargetService:
+                  Type: AWS::ECS::Service
+                  Properties:
+                  TaskDefinition: "${{ steps.register-task-def.outputs.task-def-arn }}"
+                  LoadBalancerInfo:
+                      ContainerName: "frontend"
+                      ContainerPort: 3000
+          EOF
+
+      # Step 10: Deploy to ECS via CodeDeploy (Blue-Green)
+      - name: Deploy to ECS via CodeDeploy
+        id: deploy
+        run: |
+          DEPLOYMENT_ID=$(aws deploy create-deployment \
+              --application-name ${{ env.CODEDEPLOY_APP }} \
+              --deployment-group-name ${{ env.CODEDEPLOY_GROUP }} \
+              --revision revisionType=AppSpecContent,appSpecContent={content="$(cat appspec.yaml)"} \
+              --query 'deploymentId' \
+              --output text)
+
+          echo "deployment-id=$DEPLOYMENT_ID" >> $GITHUB_OUTPUT
+          echo "Deployment ID: $DEPLOYMENT_ID"
+
+      # Step 11: Wait for deployment to complete
+      - name: Wait for deployment
+        run: |
+          echo "Waiting for deployment ${{ steps.deploy.outputs.deployment-id }} to complete..."
+          aws deploy wait deployment-successful \
+              --deployment-id ${{ steps.deploy.outputs.deployment-id }}
+
+          echo "✅ Deployment completed successfully!"
+
+      # Step 12: Get deployment status
+      - name: Get deployment status
+        if: always()
+        run: |
+          aws deploy get-deployment \
+              --deployment-id ${{ steps.deploy.outputs.deployment-id }} \
+              --query 'deploymentInfo.status' \
+              --output text

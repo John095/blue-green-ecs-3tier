@@ -1,0 +1,41 @@
+version: "3.8"
+
+services:
+  nextjs-frontend:
+    build:
+      context: ./frontend
+    ports:
+      - "3000:3000"
+    environment:
+      - NODE_ENV=production
+      - BACKEND_URL=http://flask-backend:5000
+    depends_on:
+      - flask-backend
+
+  flask-backend:
+    build: ./backend
+    ports:
+      - "5000:5000"
+    environment:
+      - FLASK_ENV=production
+      - DB_HOST=postgres-db
+      - DB_NAME=main_db
+      - DB_USER=postgres_admin
+      - DB_PASSWORD=securepassword123
+      - DB_PORT=5432
+    depends_on:
+      - postgres-db
+
+  postgres-db:
+    image: postgres:18
+    environment:
+      - POSTGRES_USER=postgres_admin
+      - POSTGRES_PASSWORD=securepassword123
+      - POSTGRES_DB=main_db
+    ports:
+      - "5432:5432"
+    volumes:
+      - db-data:/var/lib/postgresql
+
+volumes:
+  db-data:
